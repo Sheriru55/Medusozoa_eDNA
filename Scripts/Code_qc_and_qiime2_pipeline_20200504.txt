@@ -1,0 +1,139 @@
+##################################################
+Ames et al. 2019 (In review) Cassiopea eDNA project 
+##################################################
+
+## Processing MinKNOW generated multi-gene target Nanopore metabarcode data for Qiime2 analysis
+
+------ RE-Basecalling of Nanopore MinION MinKNOW data, and Read Quality Filter with Guppy (Nanopore Community)
+
+##Recall all data in MinKNOW skip, pass, fail using Guppy 
+guppy_basecaller -r -i /Library/MinKNOW/data/reads/FOLDER/fast5/folder/  --flowcell FLO-MIN106  --kit SQK-DCS108  --cpu_threads_per_caller 7 --print_workflows --verbose_logs --min_qscore 9 --qscore_filtering -s /Library/MinKNOW/data/reads/FOLDER/folder_gupp_fastq
+cat /Library/MinKNOW/data/reads/FOLDER/folder/pass/* >> gupp_pass.fastq ##concatenate passed reads from all collections sites into a single BC1_7.fastq file 
+ 
+------ Demultiplex files by station with Porechop  —-------------
+##https://github.com/rrwick/Porechop
+##Drop reads with barcodes in the middle, use threshold of 85% match of both barcodes
+$ porechop -i BC1_7.fastq -b demult_reads_85_dir --barcode_threshold 85 --discard_middle --require_two_barcodes --verbosity 2
+
+
+------ Trimming MinION adaptors with Nanofilt  —-------------
+##https://github.com/wdecoster/nanofilt
+##Trims 50 base pairs from either end corresponding to Minion adaptors and barcodes. 
+gunzip -c BC01.fastq.gz | NanoFilt -q 10 -l 550 --headcrop 50 --tailcrop 50  | gzip > BC01_pc_med_nanofilt_trim.fastq.gz ##Do this for each barcoded dataset
+
+## Combine all Nanopore reads into a single file <<BC1_7.fastq>>
+
+
+------ READS PROCESSING —-------------
+
+#Remove adapters and primers
+cutadapt -b file:../Minion.fa -o BC1_7.trim.fastq BC01_7.fastq
+##NOTE* this "Minion.fa" adaptor file is part of supplemental files. 
+
+## -b ADAPTER, --anywhere=ADAPTER ## give path to custom file containing all known primers and adaptors <<primer_adaptor.fasta>>
+## Marcel Martin. Cutadapt removes adapter sequences from high-throughput sequencing reads. EMBnet.Journal, 17(1):10-12, May 2011. http://dx.doi.org/10.14806/ej.17.1.200
+
+#convert fastq to fasta
+seqtk seq -a BC01_7.trim.fastq > BC01_7.trim.fasta
+
+#remove reads smaller than 550 bp
+perl removesmalls.pl 550 BC1_7.trim.fasta  >> BC1_7.550.trim.fasta
+###removesmalls.pl 550 FILE (see script### credit Vivek Krishnakumar https://www.biostars.org/u/3728/)
+
+
+------- SPLIT 16S and COI reads with BLAST ------
+
+#identify 16S reads using blast
+makeblastdb -in MIDORI_16S.v5.fasta -dbtype nucl -out MIDORI_16S
+blastn -db MIDORI_16S -query BC01.trim.550.fasta  -outfmt 6 -max_target_seqs 1 -num_threads 3 -out BC01.trim.550.blast.out
+cat BC01.trim.550.blast.out |cut -s -f 1 > BC01.trim.550.blastn.list
+cdbfasta BC01.trim.550.fasta
+cat BC01.trim.550.blast.out | cdbyank BC01.trim.550.fasta.cidx > BC01.trim.550.16S.fasta
+#concatenate all samples 
+#Repeat with COI database to pull out COI reads
+
+------ IMPORT —-------------
+#Import Reads File (convert to qza)
+qiime tools import --input-path BC-16S.trim.550.fasta --output-path BC-16S.trim.550.fasta.qza --type 'SampleData[Sequences]'
+
+#NOTE: Input sequences must be named with an underscore i.e. >BC01_*
+#The identifier for the sample becomes BC01
+
+#Import Reference Database (Sequences)
+qiime tools import --input-path MIDORI_16S.fasta  --output-path MIDORI_16S.qza --type 'FeatureData[Sequence]'
+
+#Import Reference Database (Taxonomy)
+qiime tools import --input-path MIDORI_UNIQUE_20180221_lrRNA.taxon --output-path MIDORI_UNIQUE-16S.taxon.qza --type 'FeatureData[Taxonomy]'
+
+
+------ Processing Sequences ----------- 
+#vsearch dereplicate
+qiime vsearch dereplicate-sequences --i-sequences BC-16S.trim.550.fasta.qza --o-dereplicated-table derep-16S-table.qza --o-dereplicated-sequences derep-16S-seq.qza
+
+#vsearch clustering options: open, closed, de novo
+qiime vsearch cluster-features-closed-reference --i-sequences derep-16S-seq.qza --i-table derep-16S-table.qza --i-reference-sequences ../../2018/MIDORI_UNIQUE_16S.qza --p-perc-identity 0.80 --o-clustered-table 16S_closed80_clustered-table --o-clustered-sequences 16S_closed80_clustered-seq --o-unmatched-sequences 16S_closed80_unmatched-seq
+
+#chimera check
+qiime vsearch uchime-denovo --i-sequences 16S_closed80_clustered-seq.qza --i-table 16S_closed80_clustered-table.qza --output-dir chimera-denovo
+#filter out low count features (< 5)
+qiime feature-table filter-features --i-table 16S_closed80_clustered-table.qza --p-min-frequency 5 --o-filtered-table 16S_closed80_clustered-table.filtered.qza##Process .qza files
+
+#unzip 16S_closed80_clustered-table and move to data and append
+#requires cdbfasta (https://github.com/gpertea/cdbfasta)
+
+unzip chimera-denovo/nonchimeras.qza -d chimera-denovo/nonchimeras
+mv chimera-denovo/nonchimeras/* chimera-denovo/nonchimeras/01
+
+unzip 16S_closed80_clustered_table.filtered.qza -d 16S_closed80_clustered_table.filtered
+mv 16S_closed80_clustered_table.filtered/* 16S_closed80_clustered_table.filtered/01
+
+biom convert -i 16S_closed80_clustered_table.filtered/01/data/feature-table.biom -o 16S_closed80_clustered_table.filtered/01/data/feature-table.txt --to-tsv --header-key taxonomy
+cut -s -f1 16S_closed80_clustered_table.filtered/01/data/feature-table.txt > 16S_closed80_clustered_table.filtered/01/data/feature-table.list
+#index non-chimeric dna-sequencescdbfasta chimera-denovo/nonchimeras/01/data/dna-sequences.fasta
+
+#use filtered feature-table as list for cdbyank
+cat 16S_closed80_clustered_table.filtered/01/data/feature-table.list |cdbyank chimera-denovo/nonchimeras/01/data/dna-sequences.fasta.cidx > chimera-denovo/nonchimeras/01/data/dna-sequences.filtered.fasta
+
+grep '^>' chimera-denovo/nonchimeras/01/data/dna-sequences.filtered.fasta > chimera-denovo/nonchimeras/01/data/dna-sequences.filtered.list
+sed 's/>//g' chimera-denovo/nonchimeras/01/data/dna-sequences.filtered.list > chimera-denovo/nonchimeras/01/data/dna-sequences.filtered.list.tmp
+mv chimera-denovo/nonchimeras/01/data/dna-sequences.filtered.list.tmp chimera-denovo/nonchimeras/01/data/dna-sequences.filtered.list
+
+#append headers 
+grep -f chimera-denovo/nonchimeras/01/data/dna-sequences.filtered.list 16S_closed80_clustered_table.filtered/01/data/feature-table.txt > 16S_closed80_clustered_table.filtered/01/data/feature-table.nonchimeras.txt 
+
+cat 16S_closed80_clustered_table.filtered/01/data/feature-table.txt |head -2 >> 16S_closed80_clustered_table.filtered/01/data/tmp.txt
+cat 16S_closed80_clustered_table.filtered/01/data/feature-table.nonchimeras.txt >> 16S_closed80_clustered_table.filtered/01/data/tmp.txt
+mv 16S_closed80_clustered_table.filtered/01/data/tmp.txt 16S_closed80_clustered_table.filtered/01/data/feature-table.nonchimeras.txt
+sed  -e 's/\ttaxonomy//g' 16S_closed80_clustered_table.filtered/01/data/feature-table.nonchimeras.txt > 16S_closed80_clustered_table.filtered/01/data/feature-table.nonchimeras.tmp
+mv 16S_closed80_clustered_table.filtered/01/data/feature-table.nonchimeras.tmp 16S_closed80_clustered_table.filtered/01/data/feature-table.nonchimeras.txt 
+
+biom convert -i 16S_closed80_clustered_table.filtered/01/data/feature-table.nonchimeras.txt -o 16S_closed80_clustered_table.filtered/01/data/feature-table.nonchimeras.biom --table-type="OTU table" --to-hdf5
+
+qiime tools import --input-path 16S_closed80_clustered_table.filtered/01/data/feature-table.nonchimeras.biom --output-path feature-table.filtered.nonchimeras.qza --type 'FeatureTable[Frequency]'
+
+qiime tools import --input-path chimera-denovo/nonchimeras/01/data/dna-sequences.filtered.fasta --output-path dna-sequences.filtered.nonchimeras.qza --type 'FeatureData[Sequence]'
+
+
+-------- VISUALIZATION --------
+#Create Visual Summaries of Data
+qiime feature-table summarize --i-table feature-table.filtered.nonchimeras.qza --o-visualization feature-table.filtered.nonchimeras.qzv --m-sample-metadata-file  metadata_file.txt
+##NOTE the metadata text file is provided as a supplemental file
+
+
+#generate .qzv of filtered, nonchimeric sequences
+qiime feature-table tabulate-seqs   --i-data dna-sequences.filtered.nonchimeras.qza --o-visualization dna-sequences.filtered.nonchimeras.qzv
+
+
+#generate barplot
+qiime taxa barplot --i-table feature-table.filtered.nonchimeras.qza --i-taxonomy ../MIDORI_UNIQUE-16S.taxon.qza --m-metadata-file metadata_file.txt --output-dir taxa_barplot
+
+
+-------- DIVERSITY ANALYSIS --------#generate tree (Newick format)
+qiime phylogeny align-to-tree-mafft-fasttree --i-sequences dna-sequences.filtered.nonchimeras.qza --o-alignment 16S-aligned_clustered-seq.qza --o-masked-alignment 16S-masked-aligned_clustered-seq.qza --o-tree unrooted-tree.qza --o-rooted-tree rooted-tree.qza
+
+#Calculate alpha diversity for pre-defined set of metrics. Sampling depth should be adjusted according to frequency. Calculate significance based on metadata categories.
+#alpha rarefaction
+qiime diversity alpha-rarefaction --i-table feature-table.filtered.nonchimeras.qza --p-max-depth 500 --i-phylogeny rooted-tree.qza --m-metadata-file metadata_file.txt --output-dir alpha-rarefaction
+
+#with phylogeny
+qiime diversity core-metrics-phylogenetic --i-phylogeny rooted-tree.qza --i-table feature-table.filtered.nonchimeras.qza --p-sampling-depth 4000 --m-metadata-file metadata_file.txt --output-dir core-metric-4000_phylogenetic
